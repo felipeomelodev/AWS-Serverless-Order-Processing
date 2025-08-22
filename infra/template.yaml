@@ -1,0 +1,420 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Projeto final do Programa AWS Developer da Escola da Nuvem.
+  Arquitetura serverless orientada a eventos para processamento de pedidos,
+  com ingestão via API Gateway e S3, orquestração com SQS e EventBridge,
+  persistência em DynamoDB e resiliência com DLQs.
+
+Resources:
+
+  # =========================================================
+  # IAM ROLES – Definição de permissões mínimas para Lambdas
+  # =========================================================
+  LambdaPreValidacaoRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lambda-prevalidacao-role-felipemelo
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SQSSendMessageToPedidosFIFO-felipemelo
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt PedidosQueue.Arn
+
+  LambdaValidacaoPedidosRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lambda-validacao-pedidos-role-felipemelo
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SQSReadEventBridgePutPolicy-felipemelo
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt PedidosQueue.Arn
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !GetAtt PedidosEventBus.Arn
+
+  LambdaProcessaPedidosRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lambda-processa-pedidos-role-felipemelo
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBWritePolicy-felipemelo
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt PedidosDynamoDB.Arn
+
+  LambdaAlteraCancelaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lambda-altera-cancela-role-felipemelo
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SQSDynamoDBPolicy-felipemelo
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt CancelaPedidoQueue.Arn
+                  - !GetAtt AlteraPedidoQueue.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt PedidosDynamoDB.Arn
+
+  # =========================================================
+  # SQS – Filas de pedidos e DLQs para tolerância a falhas
+  # =========================================================
+  PedidosDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: pedidos-fifo-dlq-felipemelo.fifo
+      FifoQueue: true
+
+  PedidosQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: pedidos-fifo-queue-felipemelo.fifo
+      FifoQueue: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt PedidosDLQ.Arn
+        maxReceiveCount: 3
+
+  PedidosPendentesDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: pedidos-pendentes-dlq-felipemelo
+
+  PedidosPendentesQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: pedidos-pendentes-queue-felipemelo
+      VisibilityTimeout: 70
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt PedidosPendentesDLQ.Arn
+        maxReceiveCount: 3
+
+  CancelaPedidoDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: cancela-pedido-dlq-felipemelo
+
+  CancelaPedidoQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: cancela-pedido-queue-felipemelo
+      VisibilityTimeout: 70
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CancelaPedidoDLQ.Arn
+        maxReceiveCount: 3
+
+  AlteraPedidoDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: altera-pedido-dlq-felipemelo
+
+  AlteraPedidoQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: altera-pedido-queue-felipemelo
+      VisibilityTimeout: 70
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AlteraPedidoDLQ.Arn
+        maxReceiveCount: 3
+
+  # =========================================================
+  # EVENTBRIDGE – Barramento e regras para novos pedidos, alteração e cancelamento
+  # =========================================================
+  PedidosEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: pedidos-event-bus-felipemelo
+
+  NovoPedidoValidadoRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: novo-pedido-validado-rule-felipemelo
+      EventBusName: !Ref PedidosEventBus
+      EventPattern:
+        source: [ lab.aula1.pedidos.validacao ]
+        detail-type: [ NovoPedidoValidado ]
+      Targets:
+        - Arn: !GetAtt PedidosPendentesQueue.Arn
+          Id: PedidosPendentesTarget
+
+  CancelaPedidoRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: cancela-pedido-rule-felipemelo
+      EventBusName: !Ref PedidosEventBus
+      EventPattern:
+        source: [ lab.aula4.operacoes ]
+        detail-type: [ CancelaPedido ]
+      Targets:
+        - Arn: !GetAtt CancelaPedidoQueue.Arn
+          Id: CancelaPedidoTarget
+
+  AlteraPedidoRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: altera-pedido-rule-felipemelo
+      EventBusName: !Ref PedidosEventBus
+      EventPattern:
+        source: [ lab.aula4.operacoes ]
+        detail-type: [ AlterarPedido ]
+      Targets:
+        - Arn: !GetAtt AlteraPedidoQueue.Arn
+          Id: AlteraPedidoTarget
+
+  # =========================================================
+  # DYNAMODB – Tabela principal de pedidos
+  # =========================================================
+  PedidosDynamoDB:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: pedidos-db-felipemelo
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pedidoId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pedidoId
+          KeyType: HASH
+
+  # =========================================================
+  # S3 – Bucket para ingestão de arquivos e artefatos de Lambda
+  # =========================================================
+  PedidosBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: pedidos-bucket-felipemelo
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt IngestaoS3Lambda.Arn
+    DependsOn: LambdaS3Permission
+
+  LambdaS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref IngestaoS3Lambda
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt PedidosBucket.Arn
+
+  # =========================================================
+  # LAMBDAS – Funções para ingestão, validação, processamento e alterações
+  # =========================================================
+  PreValidacaoLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: pre-validacao-lambda-felipemelo
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaPreValidacaoRole.Arn
+      Code:
+        S3Bucket: !Ref PedidosBucket
+        S3Key: pre-validacao.zip
+      Environment:
+        Variables:
+          SQS_QUEUE_URL: !Ref PedidosQueue
+
+  ValidacaoPedidosLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: validacao-pedidos-lambda-felipemelo
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaValidacaoPedidosRole.Arn
+      Code:
+        S3Bucket: !Ref PedidosBucket
+        S3Key: validacao-pedidos.zip
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref PedidosEventBus
+
+  ProcessaPedidosLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: processa-pedidos-lambda-felipemelo
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaProcessaPedidosRole.Arn
+      Code:
+        S3Bucket: !Ref PedidosBucket
+        S3Key: processa-pedidos.zip
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref PedidosDynamoDB
+
+  IngestaoS3Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ingestao-s3-lambda-felipemelo
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaPreValidacaoRole.Arn
+      Code:
+        S3Bucket: !Ref PedidosBucket
+        S3Key: ingestao-s3.zip
+      Environment:
+        Variables:
+          SQS_QUEUE_URL: !Ref PedidosQueue
+
+  CancelaPedidoLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: cancela-pedido-lambda-felipemelo
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaAlteraCancelaRole.Arn
+      Timeout: 60
+      Code:
+        S3Bucket: !Ref PedidosBucket
+        S3Key: cancela-pedido.zip
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref PedidosDynamoDB
+
+  AlteraPedidoLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: altera-pedido-lambda-felipemelo
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaAlteraCancelaRole.Arn
+      Timeout: 60
+      Code:
+        S3Bucket: !Ref PedidosBucket
+        S3Key: altera-pedido.zip
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref PedidosDynamoDB
+
+  # =========================================================
+  # EVENT SOURCE MAPPINGS – Conectando filas às Lambdas
+  # =========================================================
+  SQSTriggerValidacao:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      EventSourceArn: !GetAtt PedidosQueue.Arn
+      FunctionName: !Ref ValidacaoPedidosLambda
+
+  SQSTriggerProcessamento:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      EventSourceArn: !GetAtt PedidosPendentesQueue.Arn
+      FunctionName: !Ref ProcessaPedidosLambda
+
+  SQSTriggerCancela:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      EventSourceArn: !GetAtt CancelaPedidoQueue.Arn
+      FunctionName: !Ref CancelaPedidoLambda
+
+  SQSTriggerAltera:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      EventSourceArn: !GetAtt AlteraPedidoQueue.Arn
+      FunctionName: !Ref AlteraPedidoLambda
+
+  # =========================================================
+  # API GATEWAY – Endpoint de entrada de pedidos
+  # =========================================================
+  PedidosApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: pedidos-api-felipemelo
+      Description: API REST para recebimento de pedidos
+      EndpointConfiguration:
+        Types: [ REGIONAL ]
+
+  PedidosResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt PedidosApi.RootResourceId
+      PathPart: pedidos
+      RestApiId: !Ref PedidosApi
+
+  PedidosMethodPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PedidosApi
+      ResourceId: !Ref PedidosResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PreValidacaoLambda.Arn}/invocations
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: PedidosMethodPost
+    Properties:
+      RestApiId: !Ref PedidosApi
+      StageName: dev
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PreValidacaoLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PedidosApi}/*/POST/pedidos
